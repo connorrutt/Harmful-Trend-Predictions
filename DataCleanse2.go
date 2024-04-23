@@ -1,83 +1,129 @@
 package main
 
 import (
-	"database/sql"
-	"fmt"
+    "database/sql"
+    "fmt"
+    "log"
+    "os"
 
-	_ "(Link to original DB)"
+    _ "github.com/lib/pq"
 )
 
 func main() {
-	db, err := sql.Open("postgres", "user=myuser password=mypassword host=localhost dbname=mydatabase")
-	if err != nil {
-		fmt.Println("Error connecting to the database:", err)
-		return
-	}
-	defer db.Close()
+    user := os.Getenv("DB_USER")
+    password := os.Getenv("DB_PASSWORD")
+    host := os.Getenv("DB_HOST")
+    dbname := os.Getenv("DB_NAME")
 
-	_, err = db.Exec("CREATE TABLE cleaned_ratings (user_id text, item_id text, rating float)")
-	if err != nil {
-		fmt.Println("Error creating cleaned_ratings table:", err)
-		return
-	}
+    connStr := fmt.Sprintf("user=%s password=%s host=%s dbname=%s", user, password, host, dbname)
 
-	_, err = db.Exec("INSERT INTO cleaned_ratings SELECT DISTINCT user_id, item_id, rating FROM ratings")
-	if err != nil {
-		fmt.Println("Error inserting data into cleaned_ratings table:", err)
-		return
-	}
+    db, err := sql.Open("postgres", connStr)
+    if err != nil {
+        log.Fatal("Error connecting to the database:", err)
+    }
+    defer db.Close()
 
-	_, err = db.Exec("DELETE FROM cleaned_ratings WHERE rating < 3")
-	if err != nil {
-		fmt.Println("Error deleting low-quality ratings:", err)
-		return
-	}
+    err = db.Ping()
+    if err != nil {
+        log.Fatal("Error pinging the database:", err)
+    }
 
-	_, err = db.Exec("DELETE FROM cleaned_ratings WHERE user_id IN (SELECT user_id FROM cleaned_ratings GROUP BY user_id HAVING COUNT(*) < 5)")
-	if err != nil {
-		fmt.Println("Error deleting users with less than 5 ratings:", err)
-		return
-	}
+    _, err = db.Exec(`
+        CREATE TABLE IF NOT EXISTS cleaned_ratings (
+            user_id text,
+            item_id text,
+            rating float
+        )
+    `)
+    if err != nil {
+        log.Fatal("Error creating cleaned_ratings table:", err)
+    }
 
-	_, err = db.Exec("DELETE FROM cleaned_ratings WHERE item_id IN (SELECT item_id FROM cleaned_ratings GROUP BY item_id HAVING COUNT(*) < 5)")
-	if err != nil {
-		fmt.Println("Error deleting items with less than 5 ratings:", err)
-		return
-	}
+    tx, err := db.Begin()
+    if err != nil {
+        log.Fatal("Error starting a transaction:", err)
+    }
 
-	_, err = db.Exec("DELETE FROM cleaned_ratings WHERE (user_id, item_id) IN (SELECT user_id, item_id FROM cleaned_ratings GROUP BY user_id, item_id HAVING COUNT(*) > 1)")
-	if err != nil {
-		fmt.Println("Error deleting users who have rated the same item multiple times:", err)
-		return
-	}
+    _, err = tx.Exec(`
+        WITH cte AS (
+            SELECT DISTINCT user_id, item_id, rating
+            FROM ratings
+            WHERE rating >= 3
+        ),
+        user_counts AS (
+            SELECT user_id, COUNT(*) AS count
+            FROM cte
+            GROUP BY user_id
+            HAVING COUNT(*) >= 5
+        ),
+        item_counts AS (
+            SELECT item_id, COUNT(*) AS count
+            FROM cte
+            GROUP BY item_id
+            HAVING COUNT(*) >= 5
+        ),
+        duplicate_ratings AS (
+            SELECT user_id, item_id, COUNT(*) AS count
+            FROM cte
+            GROUP BY user_id, item_id
+            HAVING COUNT(*) > 1
+        ),
+        outlier_ratings AS (
+            SELECT *
+            FROM cte
+            WHERE rating > (SELECT AVG(rating) + 3 * STDDEV(rating) FROM cte)
+               OR rating < (SELECT AVG(rating) - 3 * STDDEV(rating) FROM cte)
+        ),
+        low_sum_users AS (
+            SELECT user_id, SUM(rating) AS sum
+            FROM cte
+            GROUP BY user_id
+            HAVING SUM(rating) < 10
+        ),
+        low_sum_items AS (
+            SELECT item_id, SUM(rating) AS sum
+            FROM cte
+            GROUP BY item_id
+            HAVING SUM(rating) < 10
+        )
+        INSERT INTO cleaned_ratings
+        SELECT cte.user_id, cte.item_id, cte.rating
+        FROM cte
+        INNER JOIN user_counts ON cte.user_id = user_counts.user_id
+        INNER JOIN item_counts ON cte.item_id = item_counts.item_id
+        LEFT JOIN duplicate_ratings ON cte.user_id = duplicate_ratings.user_id AND cte.item_id = duplicate_ratings.item_id
+        LEFT JOIN outlier_ratings ON cte.user_id = outlier_ratings.user_id AND cte.item_id = outlier_ratings.item_id AND cte.rating = outlier_ratings.rating
+        LEFT JOIN low_sum_users ON cte.user_id = low_sum_users.user_id
+        LEFT JOIN low_sum_items ON cte.item_id = low_sum_items.item_id
+        WHERE duplicate_ratings.user_id IS NULL
+          AND duplicate_ratings.item_id IS NULL
+          AND outlier_ratings.user_id IS NULL
+          AND outlier_ratings.item_id IS NULL
+          AND outlier_ratings.rating IS NULL
+          AND low_sum_users.user_id IS NULL
+          AND low_sum_items.item_id IS NULL
+    `)
+    if err != nil {
+        tx.Rollback()
+        log.Fatal("Error cleaning and filtering the data:", err)
+    }
 
-	_, err = db.Exec("DELETE FROM cleaned_ratings WHERE (item_id, user_id) IN (SELECT item_id, user_id FROM cleaned_ratings GROUP BY item_id, user_id HAVING COUNT(*) > 1)")
-	if err != nil {
-		fmt.Println("Error deleting items that have been rated by the same user multiple times:", err)
-		return
-	}
+    _, err = tx.Exec(`
+        CREATE TABLE final_ratings AS
+        SELECT user_id, item_id, AVG(rating) AS average_rating
+        FROM cleaned_ratings
+        GROUP BY user_id, item_id
+        HAVING COUNT(*) > 1
+    `)
+    if err != nil {
+        tx.Rollback()
+        log.Fatal("Error creating final_ratings table:", err)
+    }
 
-	_, err = db.Exec("DELETE FROM cleaned_ratings WHERE rating > (SELECT AVG(rating) + 3 * STDDEV(rating) FROM cleaned_ratings) OR rating < (SELECT AVG(rating) - 3 * STDDEV(rating) FROM cleaned_ratings)")
-	if err != nil {
-		fmt.Println("Error deleting ratings that are more than 3 standard deviations away from the mean:", err)
-		return
-	}
+    err = tx.Commit()
+    if err != nil {
+        log.Fatal("Error committing the transaction:", err)
+    }
 
-	_, err = db.Exec("DELETE FROM cleaned_ratings WHERE user_id IN (SELECT user_id FROM cleaned_ratings GROUP BY user_id HAVING SUM(rating) < 10)")
-	if err != nil {
-		fmt.Println("Error deleting users and items with a total rating sum less than 10:", err)
-		return
-	}
-
-	_, err = db.Exec("DELETE FROM cleaned_ratings WHERE item_id IN (SELECT item_id FROM cleaned_ratings GROUP BY item_id HAVING SUM(rating) < 10)")
-	if err != nil {
-		fmt.Println("Error deleting users and items with a total rating sum less than 10:", err)
-		return
-	}
-
-	_, err = db.Exec("CREATE TABLE final_ratings AS SELECT user_id, item_id, AVG(rating) AS average_rating FROM cleaned_ratings GROUP BY user_id, item_id HAVING COUNT(*) > 1")
-	if err != nil {
-		fmt.Println("Error creating final_ratings table:", err)
-		return
-	}
-} //content assumes the metadata is present in the powerhouse DB
+    fmt.Println("Data cleaning and table creation completed successfully.")
+}//content assumes the metadata is present in the powerhouse DB
