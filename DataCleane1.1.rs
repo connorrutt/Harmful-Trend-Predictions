@@ -91,7 +91,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
 
 
-/// death is really easy to process when you just take it at face value. Lifes life and I echo that. But seeing others hurt almost in a way that is accepting grief just to know pat is in better place means a lot. 
+/// death is really easy to process
+// when you just take it at face value. 
+//Lifes life and I echo that. 
+//But seeing others hurt almost in a way that is accepting grief just to know pat is in better place means a lot. 
 
 
     conn.execute(
