@@ -91,12 +91,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
 
 
-/// death is really easy to process
-// when you just take it at face value. 
-//Lifes life and I echo that. 
-//But seeing others hurt almost in a way that is accepting grief just to know pat is in better place means a lot. 
-
-
     conn.execute(
         "CREATE TABLE IF NOT EXISTS final_ratings AS
         SELECT user_id, item_id, AVG(rating) AS average_rating
